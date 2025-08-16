@@ -6,13 +6,18 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const rateLimit = require('express-rate-limit');
 
+const twilio = require('twilio');
+
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
+const PUBLIC_BASE_URL   = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+const WEBHOOK_VALIDATE  = String(process.env.TWILIO_WEBHOOK_VALIDATE || 'true').toLowerCase() !== 'false';
+
 const pinAttempts = new Map();                 // CallSid -> count (MVP)
 const MAX_VOICE_ATTEMPTS = Number(process.env.MAX_VOICE_ATTEMPTS || 5);
 
 const app = express();
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || '';
-const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || '';
 
 /**
  * CORS strategy
@@ -26,6 +31,37 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .filter(Boolean);
 
 const exposed = ["X-IDC-Sector", "X-IDC-Node", "X-IDC-Token-Fragment"];
+
+// ─── Build/version stamp so we can prove what's running ───
+const cp = require('node:child_process');
+
+function gitShaShort() {
+  try {
+    // Works locally; often works on Render too
+    return cp.execSync('git rev-parse --short HEAD').toString().trim();
+  } catch {
+    // Render may expose commit via env; fall back to env or 'unknown'
+    return (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) || 'unknown';
+  }
+}
+
+const BUILD = {
+  sha: gitShaShort(),
+  startedAt: new Date().toISOString(),
+  node: process.version,
+  env: process.env.NODE_ENV || 'development',
+};
+
+// Add a response header on every request
+app.use((req, res, next) => {
+  res.setHeader('X-IDC-Build', `${BUILD.sha} @ ${BUILD.startedAt}`);
+  next();
+});
+
+// Quick endpoint you can curl to verify what's deployed
+app.get('/_version', (_req, res) => {
+  res.json({ ok: true, build: BUILD });
+});
 
 app.use(
   cors({
@@ -164,6 +200,27 @@ app.get('/latest', requirePin, async (_req, res) => {
   }
 });
 
+function verifyTwilio(req, res, next) {
+  if (!WEBHOOK_VALIDATE) return next(); // allow local curl tests when disabled
+
+  if (!TWILIO_AUTH_TOKEN || !PUBLIC_BASE_URL) {
+    console.warn('[IDC/Twilio] Missing TWILIO_AUTH_TOKEN or PUBLIC_BASE_URL; skipping validation');
+    return next();
+  }
+
+  // Twilio signs against the exact full URL + the form body
+  const fullUrl = `${PUBLIC_BASE_URL}${req.originalUrl}`;
+  const sig = req.headers['x-twilio-signature'];
+  const ok = twilio.validateRequest(TWILIO_AUTH_TOKEN, sig, fullUrl, req.body);
+
+  if (!ok) {
+    console.warn('[IDC/Twilio] Invalid signature', { fullUrl });
+    return res.status(403).type('text/plain').send('Invalid Twilio signature');
+  }
+  return next();
+}
+
+
 // ──────────────────────────────
 // IDC Voice Assistant (Twilio IVR)
 // ──────────────────────────────
@@ -193,16 +250,19 @@ function searchContacts(contacts, qRaw) {
   return scored.map(x => x.c);
 }
 
+app.use('/voice', verifyTwilio);
+
 // Entry: menu (1 = voicemail, 2 = admin)
 app.post('/voice/answer', (req, res) => {
   callSessions.delete(req.body?.CallSid);
-    pinAttempts.delete(req.body?.CallSid);
+  pinAttempts.delete(req.body?.CallSid);
+
   const xml = twiml(
-    say('Welcome to Intergalactic Contacts.') +
-    gather('input="dtmf" numDigits="1" action="/voice/menu" method="POST" timeout="6"',
-      say('Press 1 to leave a voicemail. Press 2 for secure access.')
+    say('Sorry, the person you have dialed is unavailable.') +
+    gather('input="dtmf" numDigits="1" action="/voice/menu" method="POST" timeout="7"',
+      say('Press 1 to leave a voicemail. Press 2 to enter admin settings.')
     ) +
-    say('Sorry, I did not receive any input.') +
+    say('I did not receive any input.') +
     `<Redirect method="POST">/voice/answer</Redirect>`
   );
   res.type('text/xml').send(xml);
@@ -223,7 +283,7 @@ app.post('/voice/menu', (req, res) => {
 
   if (d === '2') {
     const xml = twiml(
-      say('Please say your phone number, or enter it now.') +
+      say('For admin access, please enter your phone number now, or say it after the tone.') +
       gather('input="speech dtmf" numDigits="15" action="/voice/phone" method="POST" timeout="7" speechTimeout="auto" speechModel="phone_call"', '') +
       say('Sorry, I did not catch that.') +
       `<Redirect method="POST">/voice/answer</Redirect>`
@@ -231,7 +291,9 @@ app.post('/voice/menu', (req, res) => {
     return res.type('text/xml').send(xml);
   }
 
-  res.type('text/xml').send(twiml(say('Sorry, I did not get that.') + `<Redirect method="POST">/voice/answer</Redirect>`));
+  res.type('text/xml').send(twiml(
+    say('I did not get that.') + `<Redirect method="POST">/voice/answer</Redirect>`
+  ));
 });
 
 // Capture phone → ask for PIN
@@ -254,29 +316,29 @@ app.post('/voice/phone', (req, res) => {
 app.post('/voice/pin', async (req, res) => {
   const { CallSid, Digits, SpeechResult } = req.body || {};
   const provided = (Digits || SpeechResult || '').replace(/\D/g, '');
-  const expected = process.env.USER_PIN || '123456';
+  const expected  = process.env.USER_PIN || '123456';
 
-  // track bad attempts per CallSid
+  const attempts = (pinAttempts.get(CallSid) || 0) + 1;
+
   if (!provided || provided !== expected) {
-    const attempts = (pinAttempts.get(CallSid) || 0) + 1;
     pinAttempts.set(CallSid, attempts);
     if (attempts >= MAX_VOICE_ATTEMPTS) {
       pinAttempts.delete(CallSid);
       callSessions.delete(CallSid);
       return res.type('text/xml').send(
-        twiml(say('Too many attempts. Goodbye.') + '<Hangup/>')
+        twiml(say('Too many attempts. Goodbye.') + hangup())
       );
     }
-    return res.type('text/xml').send(
-      twiml(say('Invalid PIN.') + '<Redirect method="POST">/voice/answer</Redirect>')
+    const xml = twiml(
+      say('Invalid PIN. Please try again.') +
+      gather('input="dtmf speech" numDigits="6" action="/voice/pin" method="POST" timeout="6" speechTimeout="auto"', '')
     );
+    return res.type('text/xml').send(xml);
   }
 
-  // success: reset counter
   pinAttempts.delete(CallSid);
 
-  const sess = callSessions.get(CallSid) || { authed: false, contacts: [], last: null };
-
+  const sess = callSessions.get(CallSid) || { phone: null, authed: false, contacts: [], last: null };
   try {
     const { data, error } = await supabase
       .from('contact_snapshots')
@@ -297,11 +359,7 @@ app.post('/voice/pin', async (req, res) => {
     sess.contacts = contacts;
     callSessions.set(CallSid, sess);
 
-    const hints = firstN(contacts, 50)
-      .map(c => (c.name || '').replace(/["<>]/g, '')) // sanitize
-      .filter(Boolean)
-      .join(',');
-
+    const hints = firstN(contacts, 50).map(c => c.name).filter(Boolean).join(',');
     const xml = twiml(
       say('Authenticated.') +
       say('Say the name of the contact you need.') +
@@ -309,34 +367,35 @@ app.post('/voice/pin', async (req, res) => {
     );
     return res.type('text/xml').send(xml);
   } catch {
-    return res.type('text/xml').send(
-      twiml(say('System error loading your contacts. Please try again later.') + hangup())
-    );
+    return res.type('text/xml').send(twiml(
+      say('System error loading your contacts. Please try again later.') + hangup()
+    ));
   }
 });
 
 /// Take speech, search, offer top matches
 app.post('/voice/search', (req, res) => {
-  const { CallSid, SpeechResult } = req.body || {};
+  const { CallSid, SpeechResult, Digits } = req.body || {};
   const sess = callSessions.get(CallSid);
 
-  // If session died, restart at the main menu
   if (!sess?.authed) {
     return res.type('text/xml').send(
       twiml(say('Session expired.') + `<Redirect method="POST">/voice/answer</Redirect>`)
     );
   }
 
-  const results = firstN(searchContacts(sess.contacts, SpeechResult), 3);
+  const phrase = (SpeechResult || '').trim().toLowerCase();
+  if (phrase === 'menu' || Digits === '9') {
+    return res.type('text/xml').send(`<Redirect method="POST">/voice/answer</Redirect>`);
+  }
 
-  // If no matches, send them back to the name prompt (menu), not PIN
+  const results = firstN(searchContacts(sess.contacts, phrase), 3);
   if (!results.length) {
-    return res.type('text/xml').send(
-      twiml(
-        say(`I could not find any contact matching ${SpeechResult || 'that'}.`) +
-        `<Redirect method="POST">/voice/menu</Redirect>`
-      )
+    const xml = twiml(
+      say(`I could not find a contact matching ${SpeechResult || 'that'}. Please say the name again.`) +
+      gather('input="speech dtmf" action="/voice/search" method="POST" timeout="7" speechTimeout="auto" speechModel="phone_call"', '')
     );
+    return res.type('text/xml').send(xml);
   }
 
   sess.last = { query: SpeechResult, results };
@@ -345,7 +404,7 @@ app.post('/voice/search', (req, res) => {
   const menu = results.map((c, i) => `${i + 1}. ${c.name}`).join('. ');
   const xml = twiml(
     say(`I found ${results.length}. ${menu}.`) +
-    say('Say one, two, or three to hear the number. Or say repeat to hear them again.') +
+    say('Say one, two, or three to hear the number. Say repeat to hear them again.') +
     gather('input="speech dtmf" action="/voice/select" method="POST" timeout="6" speechTimeout="auto"', '')
   );
   res.type('text/xml').send(xml);
@@ -465,17 +524,19 @@ if (require.main === module) {
       }
     });
 
-    
-  app.listen(PORT, () => {
-    console.log(`Contacts backend listening on http://localhost:${PORT}`);
-    if (isProd) {
+    app.listen(PORT, () => {
       console.log(
-        `CORS (prod) allowing: ${allowedOrigins.length ? allowedOrigins.join(', ') : '[none set — consider ALLOWED_ORIGINS]'}`
+        `Contacts backend listening on http://localhost:${PORT} ` +
+        `[build ${BUILD.sha} | ${BUILD.startedAt} | node ${BUILD.node} | ${BUILD.env}]`
       );
-    } else {
-      console.log('CORS (dev): allowing all origins');
-    }
-  });
+      if (isProd) {
+        console.log(
+          `CORS (prod) allowing: ${allowedOrigins.length ? allowedOrigins.join(', ') : '[none set — consider ALLOWED_ORIGINS]'}`
+        );
+      } else {
+        console.log('CORS (dev): allowing all origins');
+      }
+    });
 }
 module.exports = app;
 
